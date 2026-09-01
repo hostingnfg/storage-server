@@ -3,9 +3,9 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
-  mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -19,6 +19,14 @@ const MIN_FREE_PERCENT = 10;
 const SSH_TIMEOUT_MS = 15_000;
 const LIST_TIMEOUT_MS = 60_000;
 const MD5_FILE_RE = /^[a-fA-F0-9]{32}\.[A-Za-z0-9]+$/;
+const EPHEMERAL_FS_TYPES = new Set([
+  "tmpfs",
+  "ramfs",
+  "overlay",
+  "squashfs",
+  "autofs",
+  "devtmpfs",
+]);
 
 function loadEnv(filePath) {
   if (!existsSync(filePath)) return;
@@ -140,6 +148,69 @@ function resolveDataDir(root) {
   const raw = process.env.DATA_DIR?.trim();
   const dir = raw || join(root, "data");
   return dir.replace(/\/+$/, "") || "/";
+}
+
+function unescapeMountField(value) {
+  return String(value).replace(/\\([0-7]{3})/g, (_, oct) =>
+    String.fromCharCode(Number.parseInt(oct, 8)),
+  );
+}
+
+function containingMount(absPath) {
+  const path = absPath.replace(/\/+$/, "") || "/";
+  let best = null;
+
+  for (const line of readFileSync("/proc/self/mounts", "utf8").split("\n")) {
+    if (!line) continue;
+    const parts = line.split(" ");
+    if (parts.length < 3) continue;
+
+    const target = unescapeMountField(parts[1]).replace(/\/+$/, "") || "/";
+    const matches =
+      target === "/" ? true : path === target || path.startsWith(`${target}/`);
+    if (!matches) continue;
+    if (!best || target.length > best.target.length) {
+      best = {
+        source: unescapeMountField(parts[0]),
+        target,
+        fstype: parts[2],
+      };
+    }
+  }
+
+  return best;
+}
+
+function dataDirNotReadyReason(dir) {
+  try {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+      return `directory does not exist: ${dir}`;
+    }
+  } catch (err) {
+    return err.message;
+  }
+
+  let resolved;
+  try {
+    resolved = realpathSync(dir);
+  } catch (err) {
+    return err.message;
+  }
+
+  let mount;
+  try {
+    mount = containingMount(resolved);
+  } catch (err) {
+    return `could not read mounts: ${err.message}`;
+  }
+
+  if (!mount) {
+    return `no filesystem mount found for ${dir}`;
+  }
+  if (EPHEMERAL_FS_TYPES.has(mount.fstype)) {
+    return `${dir} is on ${mount.fstype} (${mount.target}), disk is not mounted`;
+  }
+  return null;
 }
 
 function listEnvServers() {
@@ -597,7 +668,9 @@ async function transferFile(dest, source, file) {
   }
 
   if (dest.local) {
-    mkdirSync(dest.dir, { recursive: true });
+    if (!existsSync(dest.dir) || !statSync(dest.dir).isDirectory()) {
+      throw new Error(`destination directory is gone: ${dest.dir}`);
+    }
     let existingSize = -1;
     try {
       if (existsSync(destAbs) && statSync(destAbs).isFile()) {
@@ -824,7 +897,11 @@ async function main() {
   const mainHere = isMainServerHere(process.env.MAIN_SERVER_HERE);
 
   if (mainHere) {
-    mkdirSync(dataDir, { recursive: true });
+    const notReady = dataDirNotReadyReason(dataDir);
+    if (notReady) {
+      console.log(`DATA_DIR is not ready (${notReady}), skipping move`);
+      return;
+    }
 
     let dfLine;
     try {
