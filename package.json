@@ -1,0 +1,17 @@
+{
+  "name": "storage-server",
+  "version": "1.0.0",
+  "description": "Simple file storage server",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
